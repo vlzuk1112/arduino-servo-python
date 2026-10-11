@@ -3,85 +3,122 @@ import time
 import serial.tools.list_ports
 import tkinter as tk
 from tkinter import ttk
+import threading
 
-# --- Автоматический поиск платы Arduino ---
+# --- Автопоиск Arduino ---
 ports = list(serial.tools.list_ports.comports())
 arduino_port = None
-
 for p in ports:
-    if "Arduino" in p.description or "USB-SERIAL" in p.description or "CH340" in p.description:
+    if any(x in p.description for x in ["Arduino", "USB-SERIAL", "CH340"]):
         arduino_port = p.device
         break
 
 PORT = arduino_port if arduino_port else 'COM3'
-print(f"[INFO] Подключаемся к плате на порту: {PORT}")
+print(f"[INFO] Подключение к автоматической линии на порту: {PORT}")
 
 try:
     board = pyfirmata2.Arduino(PORT)
-    servo_pin = board.get_pin('d:9:s')
+    # Настраиваем 3 привода на пины 9, 10 и 11
+    servo1 = board.get_pin('d:9:s')   # Серво 1: Конвейер
+    servo2 = board.get_pin('d:10:s')  # Серво 2: Сортировщик
+    servo3 = board.get_pin('d:11:s')  # Серво 3: Толкатель
 except Exception as e:
-    print(f"[ERROR] Не удалось подключиться: {e}")
+    print(f"[ERROR] Ошибка подключения линии: {e}")
     exit()
 
-# --- Функции управления сервоприводом ---
-def send_angle(angle):
-    """Отправка угла на Arduino и обновление текста в интерфейсе"""
-    # Сначала переводим строку в float, а затем в целое число int
-    angle = int(float(angle)) 
-    servo_pin.write(angle)
-    value_label.config(text=f"Текущий угол: {angle}°")
+# Флаг для работы автоматического режима
+auto_mode_active = False
 
+def send_angle(servo_obj, label_obj, angle):
+    """Отправка угла на конкретный привод"""
+    angle = int(float(angle))
+    servo_obj.write(angle)
+    label_obj.config(text=f"{angle}°")
 
-def set_fixed_angle(angle):
-    """Функция для кнопок фиксированного угла"""
-    slider.set(angle)  # Сдвигаем ползунок, он сам вызовет send_angle
-    send_angle(angle)
+# --- Логика автоматической линии ---
+def automation_loop():
+    """Цикл работы автоматической линии (в отдельном потоке)"""
+    global auto_mode_active
+    print("[INFO] Автоматическая линия запущена")
+    
+    try:
+        while auto_mode_active:
+            # Сценарий линии:
+            # 1. Запуск конвейера (Серво 1 в 180°)
+            slider1.set(180); send_angle(servo1, val_lbl1, 180)
+            time.sleep(1.5)
+            if not auto_mode_active: break
+            
+            # 2. Срабатывание толкателя (Серво 3 резко на 90° и обратно)
+            slider3.set(90); send_angle(servo3, val_lbl3, 90)
+            time.sleep(0.5)
+            slider3.set(0); send_angle(servo3, val_lbl3, 0)
+            time.sleep(0.5)
+            if not auto_mode_active: break
+            
+            # 3. Поворот сортировщика (Серво 2 на 45°)
+            slider2.set(45); send_angle(servo2, val_lbl2, 45)
+            time.sleep(1.0)
+            slider2.set(0); send_angle(servo2, val_lbl2, 0)
+            time.sleep(0.5)
+            
+    except Exception as e:
+        print(f"[ERROR] Сбой в автоматическом цикле: {e}")
 
-# --- Создание графического интерфейса (GUI) ---
+def toggle_auto_mode():
+    """Включение / выключение автоматики"""
+    global auto_mode_active
+    if not auto_mode_active:
+        auto_mode_active = True
+        btn_auto.config(text="СТОП ЛИНИЯ", style="Stop.TButton")
+        # Запускаем автоматику в отдельном потоке, чтобы окно интерфейса не зависало
+        threading.Thread(target=automation_loop, daemon=True).start()
+    else:
+        auto_mode_active = False
+        btn_auto.config(text="ЗАПУСТИТЬ АВТОМАТИКУ", style="TButton")
+        print("[INFO] Автоматическая линия остановлена оператором")
+
+# --- Интерфейс Tkinter ---
 root = tk.Tk()
-root.title("Управление сервоприводом")
-root.geometry("400x250")
+root.title("Управление автоматической линией")
+root.geometry("450x400")
 root.resizable(False, False)
 
-# Стили для красивого отображения
 style = ttk.Style()
 style.theme_use('clam')
+style.configure("Stop.TButton", foreground="white", background="red")
 
-# Заголовок
-title_label = ttk.Label(root, text="Управление Сервоприводом", font=("Arial", 14, "bold"))
-title_label.pack(pady=10)
+ttk.Label(root, text="Панель управления конвейером", font=("Arial", 14, "bold")).pack(pady=10)
 
-# Ползунок (Слайдер) для плавной регулировки
-slider = ttk.Scale(root, from_=0, to=180, orient="horizontal", command=send_angle)
-slider.set(90)  # Стартовое положение по центру
-slider.pack(fill="x", padx=30, pady=10)
+# Функция-помощник для создания блоков управления приводами
+def create_servo_ui(title, servo_obj, start_val):
+    frame = ttk.LabelFrame(root, text=title, padding=10)
+    frame.pack(fill="x", padx=20, pady=5)
+    
+    lbl_val = ttk.Label(frame, text=f"{start_val}°", font=("Arial", 10, "bold"), width=6)
+    lbl_val.pack(side="right", padx=5)
+    
+    sld = ttk.Scale(frame, from_=0, to=180, orient="horizontal", 
+                    command=lambda v: send_angle(servo_obj, lbl_val, v))
+    sld.set(start_val)
+    sld.pack(fill="x", expand=True, padx=5)
+    return sld, lbl_val
 
-# Текст, показывающий текущий угол
-value_label = ttk.Label(root, text="Текущий угол: 90°", font=("Arial", 11))
-value_label.pack(pady=5)
+# Создаем элементы управления для 3-х приводов
+slider1, val_lbl1 = create_servo_ui("Серво 1: Конвейерная лента", servo1, 0)
+slider2, val_lbl2 = create_servo_ui("Серво 2: Распределитель (Сортировка)", servo2, 0)
+slider3, val_lbl3 = create_servo_ui("Серво 3: Физический толкатель", servo3, 0)
 
-# Фрейм (контейнер) для кнопок быстрого выбора
-button_frame = ttk.Frame(root)
-button_frame.pack(pady=15)
+# Большая кнопка запуска автоматики
+btn_auto = ttk.Button(root, text="ЗАПУСТИТЬ АВТОМАТИКУ", command=toggle_auto_mode, width=30)
+btn_auto.pack(pady=25)
 
-# Кнопки быстрого выбора углов
-btn_0 = ttk.Button(button_frame, text="0°", command=lambda: set_fixed_angle(0))
-btn_0.pack(side="left", padx=5)
-
-btn_90 = ttk.Button(button_frame, text="90°", command=lambda: set_fixed_angle(90))
-btn_90.pack(side="left", padx=5)
-
-btn_180 = ttk.Button(button_frame, text="180°", command=lambda: set_fixed_angle(180))
-btn_180.pack(side="left", padx=5)
-
-# Обработка закрытия окна
 def on_closing():
-    print("[INFO] Закрытие программы...")
+    global auto_mode_active
+    auto_mode_active = False
     board.exit()
     root.destroy()
 
 root.protocol("WM_DELETE_WINDOW", on_closing)
-
-# Запуск цикла обработки интерфейса
-print("[SUCCESS] Графический интерфейс запущен!")
 root.mainloop()
+
