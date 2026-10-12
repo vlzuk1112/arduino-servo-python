@@ -6,67 +6,62 @@ import tkinter as tk
 from tkinter import ttk
 import threading
 
-# --- Умный автопоиск двух плат Arduino ---
+# --- Умная инициализация двух плат Arduino ---
 ports = list(serial.tools.list_ports.comports())
 firmata_port = None
 hmi_port = None
 
 print("[INFO] Сканирование портов системы...")
-for p in ports:
-    if any(x in p.description for x in ["Arduino", "USB-SERIAL", "CH340"]):
-        # Проверяем, занят ли порт Firmata, или пытаемся распределить
-        if not firmata_port:
-            firmata_port = p.device
-        else:
-            hmi_port = p.device
+arduino_ports = [p.device for p in ports if any(x in p.description for x in ["Arduino", "USB-SERIAL", "CH340"])]
 
-# Если автопоиск не распределил порты, можно задать их вручную в качестве подстраховки:
-if not hmi_port and firmata_port:
-    # Предположим, что если определился один, второй — следующий или предыдущий порт
-    print("[WARNING] Найдена только одна плата автопоиском. Проверьте подключение второй.")
+if len(arduino_ports) >= 2:
+    firmata_port = arduino_ports[0]
+    hmi_port = arduino_ports[1]
+elif len(arduino_ports) == 1:
+    firmata_port = arduino_ports[0]
+    hmi_port = 'COM4'
+else:
+    firmata_port = 'COM3'
+    hmi_port = 'COM4'
 
-# Настройки портов по умолчанию, если платы не определились автоматически
-if not firmata_port: firmata_port = 'COM3'
-if not hmi_port: hmi_port = 'COM4'
-
-# --- Инициализация Первой Arduino (Исполнительная линия Firmata) ---
+# --- Подключение Первой Arduino (Исполнительная линия Firmata) ---
 try:
     board = pyfirmata2.Arduino(firmata_port)
-    servo1 = board.get_pin('d:9:s')  
-    servo2 = board.get_pin('d:10:s') 
-    servo3 = board.get_pin('d:11:s') 
+    servo1 = board.get_pin('d:9:s')   # Конвейер
+    servo2 = board.get_pin('d:10:s')  # Сортировщик
+    servo3 = board.get_pin('d:11:s')  # Толкатель
     print(f"[SUCCESS] Первая Arduino (Линия) подключена на порту {firmata_port}")
 except Exception as e:
     print(f"[ERROR] Не удалось подключить Исполнительную плату: {e}")
     exit()
 
-# --- Инициализация Второй Arduino (HMI / Физическая Кнопка) ---
+# --- Подключение Второй Arduino (HMI Контроллер пульта) ---
 hmi_serial = None
 try:
     hmi_serial = serial.Serial(hmi_port, 9600, timeout=0.1)
-    print(f"[SUCCESS] Вторая Arduino (HMI Кнопка) подключена на порту {hmi_port}")
+    print(f"[SUCCESS] Вторая Arduino (HMI Пульт) подключена на порту {hmi_port}")
 except Exception as e:
     print(f"[WARNING] Физическая плата HMI не найдена на {hmi_port}: {e}")
-    print("[INFO] Скрипт запущен в режиме программной симуляции E-Stop.")
+    print("[INFO] Скрипт запущен в режиме программной симуляции пульта.")
 
 # Глобальные флаги состояний линии
 auto_mode_active = False
 emergency_active = False
+overlay = None
 
 def send_angle(servo_obj, label_obj, angle):
-    """Отправка угла на выбранный привод с защитой от изменения при аварии"""
+    """Отправка угла на выбранный привод"""
     if emergency_active: return  
     angle = int(float(angle))
     servo_obj.write(angle)
     label_obj.config(text=f"{angle}°")
 
-# --- Поток непрерывного считывания физической кнопки ---
-
+# --- Поток непрерывного считывания физического пульта оператора ---
 def hmi_listener():
     global emergency_active, auto_mode_active
     if not hmi_serial: return
     
-    print("[INFO] Поток считывания физической кнопки E-Stop запущен.")
+    print("[INFO] Поток считывания физического пульта HMI запущен.")
     while True:
         try:
             if hmi_serial.in_waiting > 0:
@@ -77,48 +72,46 @@ def hmi_listener():
                     root.after(0, trigger_emergency_stop)
                     
                 elif line == "RESET_EMERGENCY":
-                    print("[🔄 SYSTEM] Получен физический сигнал сброса аварии.")
-                    # Безопасно закрываем красное окно из потока Tkinter
+                    print("[🔄 SYSTEM] Аварийный режим сброшен с физической панели.")
                     root.after(0, dismiss_emergency)
+                    
+                elif line == "TOGGLE_AUTOMATION":
+                    print("[⚡ HMI] Нажата зеленая кнопка на пульте оператора.")
+                    # Безопасно вызываем переключение режима автоматики в потоке GUI
+                    root.after(0, toggle_auto_mode)
                     
         except Exception as e:
             print(f"[ERROR] Ошибка чтения HMI-порта: {e}")
             break
         time.sleep(0.05)
 
-
 # --- Логика Аварийного Останова (E-Stop) ---
 def trigger_emergency_stop():
     global auto_mode_active, emergency_active
-    if emergency_active: return # Игнорируем повторные нажатия
+    if emergency_active: return  
     
-    auto_mode_active = False  # Мгновенно разрываем цикл автоматики конвейера
+    auto_mode_active = False  
     emergency_active = True
     print("[🚨 SYSTEM] АВАРИЙНЫЙ ОСТАНОВ АКТИВИРОВАН!")
     
-    # Мгновенно переводим все сервоприводы линии в безопасное положение (0 градусов)
     try:
         servo1.write(0); val_lbl1.config(text="0°"); slider1.set(0)
         servo2.write(0); val_lbl2.config(text="0°"); slider2.set(0)
         servo3.write(0); val_lbl3.config(text="0°"); slider3.set(0)
     except Exception as e:
-        print(f"[WARNING] Ошибка перевода сервоприводов в безопасный режим: {e}")
+        print(f"[WARNING] Ошибка сброса приводов: {e}")
     
-    # Блокируем кнопку запуска на основном экране
     btn_auto.config(text="ЛИНИЯ ЗАБЛОКИРОВАНА", state="disabled")
-    
-    # Открываем аварийное модальное окно поверх экрана
     show_emergency_overlay()
 
 def show_emergency_overlay():
     global overlay
+    if overlay and overlay.winfo_exists(): return
     overlay = tk.Toplevel(root)
     overlay.title("🚨 АВАРИЙНЫЙ ОСТАНОВ ЛИНИИ")
     overlay.geometry("450x400")
-    overlay.configure(bg="#d9534f") # Яркий аварийный красный цвет
-    overlay.grab_set()  # Перехватывает фокус и блокирует клики по главному окну
-    
-    # Запрещаем закрывать аварийный экран на крестик, требуем осознанный сброс аварии
+    overlay.configure(bg="#d9534f")  
+    overlay.grab_set()  
     overlay.protocol("WM_DELETE_WINDOW", lambda: None) 
     
     lbl_warn = tk.Label(overlay, text="⚠️ ВНИМАНИЕ! ⚠️\n\nНАЖАТА ФИЗИЧЕСКАЯ КНОПКА\nАВАРИЙНОГО ОСТАНОВА", 
@@ -131,11 +124,12 @@ def show_emergency_overlay():
     btn_reset.pack(pady=40)
 
 def dismiss_emergency():
-    global emergency_active
+    global emergency_active, overlay
     emergency_active = False
     btn_auto.config(text="ЗАПУСТИТЬ АВТОМАТИКУ", state="normal", style="TButton")
-    overlay.destroy()
-    print("[INFO] Аварийный режим успешно сброшен оператором. Линия готова к работе.")
+    if overlay and overlay.winfo_exists():
+        overlay.destroy()
+    print("[INFO] Аварийный режим успешно сброшен. Линия готова к работе.")
 
 # --- Поток автоматической конвейерной линии ---
 def automation_loop():
@@ -143,7 +137,6 @@ def automation_loop():
     print("[INFO] Конвейерная линия запущена в автоматическом режиме.")
     try:
         while auto_mode_active:
-            # Сценарий автоматизации конвейера
             slider1.set(180); send_angle(servo1, val_lbl1, 180)
             time.sleep(1.5)
             if not auto_mode_active: break
@@ -167,11 +160,11 @@ def toggle_auto_mode():
     if not auto_mode_active:
         auto_mode_active = True
         btn_auto.config(text="СТОП ЛИНИЯ", style="Stop.TButton")
-        # Запускаем конвейер в отдельном потоке, чтобы окно программы не зависало
         threading.Thread(target=automation_loop, daemon=True).start()
     else:
         auto_mode_active = False
         btn_auto.config(text="ЗАПУСТИТЬ АВТОМАТИКУ", style="TButton")
+        print("[INFO] Циклический стоп линии оператором.")
 
 # --- Построение интерфейса Tkinter ---
 root = tk.Tk()
@@ -203,7 +196,6 @@ slider3, val_lbl3 = create_servo_ui("Серво 3: Физический толк
 btn_auto = ttk.Button(root, text="ЗАПУСТИТЬ АВТОМАТИКУ", command=toggle_auto_mode, width=30)
 btn_auto.pack(pady=15)
 
-# Программная кнопка-дублер E-Stop на экране ПК
 btn_gui_estop = tk.Button(root, text="🚨 ЭКСТРЕННЫЙ СТОП (ПРОГРАММНЫЙ)", bg="darkred", fg="white", 
                           font=("Arial", 10, "bold"), command=trigger_emergency_stop, pady=5)
 btn_gui_estop.pack(fill="x", padx=20, pady=5)
@@ -217,7 +209,7 @@ def on_closing():
 
 root.protocol("WM_DELETE_WINDOW", on_closing)
 
-# Запуск фонового асинхронного потока для непрерывного опроса физического COM-порта кнопки
+# Запуск фонового асинхронного потока опроса пульта HMI
 threading.Thread(target=hmi_listener, daemon=True).start()
 
 root.mainloop()
